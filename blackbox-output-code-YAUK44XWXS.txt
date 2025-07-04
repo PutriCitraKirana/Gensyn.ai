@@ -1,0 +1,166 @@
+# ================ EXTREME CDN CONFIG FOR PIPENETWORK ================
+# Specs: 64GB RAM, 32 Cores | Optimized for dataplane.pipenetwork.com
+# Tuning Targets: 
+# - 99.9%+ Cache Hit Rate
+# - 100Gbps+ Bandwidth
+# - 2M+ RPM
+# - <1ms Cache Latency
+
+user www-data;
+worker_processes 32;
+worker_cpu_affinity auto;
+worker_rlimit_nofile 500000;
+worker_rlimit_core 8G;
+pcre_jit on;
+thread_pool io_pool threads=32 max_queue=100000;
+
+events {
+    worker_connections 32768;
+    multi_accept on;
+    use epoll;
+    accept_mutex off;
+    epoll_events 32768;
+}
+
+http {
+    # ========== CORE PERFORMANCE ==========
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    aio threads=io_pool;
+    directio 16m;
+    directio_alignment 512;
+    tcp_fastopen=3;
+    reset_timedout_connection on;
+
+    # ========== CDN CACHE TIERING ==========
+    proxy_cache_path /dev/shm/edge_cache levels=1:2 
+        keys_zone=EDGE_TIER:2G max_size=48G inactive=90d
+        use_temp_path=off loader_threads=32
+        loader_files=10000 loader_sleep=10ms;
+    
+    proxy_cache_path /mnt/nvme/disk_cache levels=1:2
+        keys_zone=DISK_TIER:256m max_size=1T inactive=365d;
+
+    # ========== MEMORY OPTIMIZATION ==========
+    map_hash_bucket_size 512;
+    map_hash_max_size 262144;
+    open_file_cache max=2000000 inactive=1h;
+    open_file_cache_valid 2h;
+
+    # ========== SECURITY & PROTOCOL ==========
+    ssl_protocols TLSv1.3;
+    ssl_ecdh_curve X25519:secp384r1;
+    ssl_session_cache shared:SSL:200m;
+    ssl_session_timeout 24h;
+    ssl_buffer_size 4k;
+
+    # ========== HTTP/3 & QUIC ==========
+    http3 on;
+    http3_gso on;
+    http3_hq on;
+    quic_retry on;
+    quic_bpf on;
+
+    # ========== COMPRESSION ==========
+    brotli on;
+    brotli_comp_level 11;
+    brotli_min_length 128;
+    brotli_types *;
+
+    # ========== LOGGING ==========
+    log_format cdn_log '$remote_addr - $host [$time_iso8601] '
+                      '"$request" $status $body_bytes_sent '
+                      '"$http_referer" $upstream_cache_status '
+                      'rt=$request_time uct=$upstream_connect_time';
+    
+    access_log off;
+    error_log /var/log/nginx/cdn-error.log crit;
+
+    # ========== MAIN CDN SERVER ==========
+    server {
+        listen 443 ssl http2 http3 reuseport fastopen=8192 backlog=131072 so_keepalive=60:60:120;
+        listen [::]:443 ssl http2 http3 reuseport;
+        server_name dataplane.pipenetwork.com;
+
+        # SSL Certificate (Rotate Monthly)
+        ssl_certificate /etc/letsencrypt/live/dataplane/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/dataplane/privkey.pem;
+        ssl_trusted_certificate /etc/letsencrypt/live/dataplane/chain.pem;
+
+        # ===== CORE CACHE POLICY =====
+        location / {
+            # Cache Selection Logic
+            proxy_cache $cache_zone;
+            proxy_cache_key "$scheme://$host$uri$is_args$args";
+            proxy_cache_valid 200 206 302 90d;
+            proxy_cache_valid 404 5m;
+
+            # High-Perf Cache Features
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 100ms;
+            proxy_cache_background_update on;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+            proxy_cache_revalidate on;
+
+            # Origin Fetch
+            proxy_pass http://pipe_origin;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+
+            # Cache Control
+            expires max;
+            add_header Cache-Control "public, max-age=31536000, immutable";
+            add_header X-Cache-Status $upstream_cache_status;
+            add_header X-Edge-Location $hostname;
+        }
+
+        # ===== PURGE API =====
+        location ~ ^/pipe-purge(/.*) {
+            allow 10.0.0.0/8;
+            allow 192.168.0.0/16;
+            deny all;
+            
+            proxy_cache_purge EDGE_TIER "$scheme://$host$1";
+            proxy_cache_purge DISK_TIER "$scheme://$host$1";
+        }
+
+        # ===== HEALTH & METRICS =====
+        location /pipe-status {
+            stub_status;
+            access_log off;
+            
+            add_header Content-Type text/plain;
+            allow 127.0.0.1;
+            deny all;
+        }
+    }
+
+    # ========== ORIGIN CONFIG ==========
+    upstream pipe_origin {
+        zone origin_pool 128m;
+        least_conn;
+        server origin1.pipe.network:443 max_conns=5000;
+        server origin2.pipe.network:443 max_conns=5000;
+        keepalive 2048;
+    }
+
+    # Cache Zone Selector
+    map $request_uri $cache_zone {
+        ~\.(js|css|jpg|png|webp)$ EDGE_TIER;
+        default DISK_TIER;
+    }
+}
+
+# ===== REQUIRED KERNEL PARAMS =====
+# net.core.somaxconn = 2097152
+# net.ipv4.tcp_max_syn_backlog = 2097152
+# net.core.netdev_max_backlog = 500000
+# net.ipv4.tcp_rmem = 4096 87380 67108864
+# net.ipv4.tcp_wmem = 4096 65536 67108864
+# net.ipv4.udp_rmem_min = 16384
+# net.ipv4.udp_wmem_min = 16384
+# vm.swappiness = 1
+# vm.overcommit_memory = 1
